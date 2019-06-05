@@ -20,14 +20,14 @@ log.setLevel(logging.DEBUG)
 DEFINITION_FILE = 'greengo.yaml'
 MAGIC_DIR = '.gg'
 STATE_FILE = os.path.join(MAGIC_DIR, 'gg_state.json')
-ROOT_CA_URL = "https://www.symantec.com/content/en/us/enterprise/verisign/roots/VeriSign-Class%203-Public-Primary-Certification-Authority-G5.pem"
+ROOT_CA_URL = "https://www.amazontrust.com/repository/AmazonRootCA1.pem"
 
 DEPLOY_TIMEOUT = 90  # Timeout, seconds
 
 
 class GroupCommands(object):
-    def __init__(self):
-
+    def __init__(self, config_file=DEFINITION_FILE, bulk=False):
+        global STATE_FILE, DEFINITION_FILE, MAGIC_DIR
         s = session.Session()
         self._region = s.region_name
         if not self._region:
@@ -41,19 +41,26 @@ class GroupCommands(object):
         self._iot = s.client("iot")
         self._lambda = s.client("lambda")
         self._iam = s.client("iam")
-        self._iot_endpoint = self._iot.describe_endpoint()['endpointAddress']
+        self._iot_endpoint = self._iot.describe_endpoint(endpointType='iot:Data-ATS')['endpointAddress']
+
+        DEFINITION_FILE = config_file
 
         try:
             with open(DEFINITION_FILE, 'r') as f:
                 self.group = yaml.safe_load(f)
         except IOError:
-            log.error("Group definition file `greengo.yaml` not found. "
+            log.error("Group definition file "+DEFINITION_FILE+" not found. "
                       "Create file, and define the group definition first. "
                       "See https://github.com/greengo for details.")
             exit(-1)
 
         self.name = self.group['Group']['name']
         self._LAMBDA_ROLE_NAME = "{0}_Lambda_Role".format(self.name)
+
+        if bulk:
+            log.info("Bulk Creation Enabled")
+            MAGIC_DIR = self.name + "-GG-Config"
+            STATE_FILE = os.path.join(MAGIC_DIR, 'gg_state.json')
 
         _mkdir(MAGIC_DIR)
         self.state = _load_state()
@@ -106,10 +113,10 @@ class GroupCommands(object):
         log.info("[END] creating group {0}".format(self.group['Group']['name']))
 
     def create_root_key(self):
-        if not os.path.isfile(self.group['certs']['keypath'] + "/root-CA.crt"):
+        if not os.path.isfile(self.group['certs']['keypath'] + "/root.ca.pem"):
             urllib.urlretrieve(
                 ROOT_CA_URL,
-                self.group['certs']['keypath'] + "/root-CA.crt")
+                self.group['certs']['keypath'] + "/root.ca.pem")
 
     def deploy(self):
         if not self.state:
@@ -265,66 +272,96 @@ class GroupCommands(object):
         log.info("Lambdas function {0} updated OK!".format(lambda_name))
 
     def create_lambdas(self, update_group_version=True):
+        # if yaml file does not contain lambdas
         if not self.group.get('Lambdas'):
             log.info("Lambdas not defined. Moving on...")
             return
-
-        if self.state and self.state.get('Lambdas'):
-            log.warning("Previously created Lambdas exists. Remove before creating!")
-            return
+        # we want to create existing lambdas!
+        # if self.state and self.state.get('Lambdas'):
+        #     log.warning("Previously created Lambdas exists. Remove before creating!")
+        #     return
 
         functions = []
         self.state['Lambdas'] = []
         _update_state(self.state)
 
         for l in self.group['Lambdas']:
+
             log.info("Creating Lambda function '{0}'".format(l['name']))
 
             role_arn = l['role'] if 'role' in l else self._default_lambda_role_arn()
             log.info("Assuming role '{0}'".format(role_arn))
+            already_defined = not ('handler' in l)
+            if not already_defined:
+                zf = shutil.make_archive(
+                    os.path.join(MAGIC_DIR, l['name']), 'zip', l['package'])
+                log.debug("Lambda deployment Zipped to '{0}'".format(zf))
 
-            zf = shutil.make_archive(
-                os.path.join(MAGIC_DIR, l['name']), 'zip', l['package'])
-            log.debug("Lambda deployment Zipped to '{0}'".format(zf))
+                for retry in range(3):
+                    try:
+                        with open(zf, 'rb') as f:
+                            lr = self._lambda.create_function(
+                                FunctionName=l['name'],
+                                Runtime='python2.7',
+                                Role=role_arn,
+                                Handler=l['handler'],
+                                Code=dict(ZipFile=f.read()),
+                                Environment=dict(Variables=l.get('environment', {})),
+                                Publish=True
+                            )
+                            # Break from retry cycle if lambda is created
+                            break
+                    except ClientError as e:  # Catch the right exception
+                        if "The role defined for the function cannot be assumed by Lambda" in str(e):
+                            # Function creation immediately after role creation fails with
+                            # "The role defined for the function cannot be assumed by Lambda."
+                            # See StackOverflow https://goo.gl/eTfqsS
+                            log.warning("We hit AWS bug: the role is not yet propagated."
+                                        "Taking 10 sec nap")
+                            sleep(10)
+                            continue
+                        else:
+                            raise(e)
 
-            for retry in range(3):
-                try:
-                    with open(zf, 'rb') as f:
-                        lr = self._lambda.create_function(
+                lr['ZipPath'] = zf
+            else:
+                for retry in range(3):
+                    try:
+                        lr = self._lambda.get_function_configuration(
                             FunctionName=l['name'],
-                            Runtime='python2.7',
-                            Role=role_arn,
-                            Handler=l['handler'],
-                            Code=dict(ZipFile=f.read()),
-                            Environment=dict(Variables=l.get('environment', {})),
-                            Publish=True
+                            Qualifier=l['alias']
                         )
                         # Break from retry cycle if lambda is created
                         break
-                except ClientError as e:  # Catch the right exception
-                    if "The role defined for the function cannot be assumed by Lambda" in str(e):
-                        # Function creation immediately after role creation fails with
-                        # "The role defined for the function cannot be assumed by Lambda."
-                        # See StackOverflow https://goo.gl/eTfqsS
-                        log.warning("We hit AWS bug: the role is not yet propagated."
-                                    "Taking 10 sec nap")
-                        sleep(10)
-                        continue
-                    else:
-                        raise(e)
-
-            lr['ZipPath'] = zf
+                    except ClientError as e:  # Catch the right exception
+                        if "The role defined for the function cannot be assumed by Lambda" in str(e):
+                            # Function creation immediately after role creation fails with
+                            # "The role defined for the function cannot be assumed by Lambda."
+                            # See StackOverflow https://goo.gl/eTfqsS
+                            log.warning("We hit AWS bug: the role is not yet propagated."
+                                        "Taking 10 sec nap")
+                            sleep(10)
+                            continue
+                        else:
+                            raise(e)
+                lr['already_defined'] = True;
             self.state['Lambdas'].append(rinse(lr))
             _update_state(self.state)
             log.info("Lambda function '{0}' created".format(lr['FunctionName']))
 
             # Auto-created alias uses the version of just published function
-            alias = self._lambda.create_alias(
+            if not already_defined:
+                alias = self._lambda.create_alias(
+                    FunctionName=lr['FunctionName'],
+                    Name=l.get('alias', 'default'),
+                    FunctionVersion=lr['Version'],
+                    Description='Created by greengo'
+                )
+            else:
+                alias = self._lambda.get_alias(
                 FunctionName=lr['FunctionName'],
-                Name=l.get('alias', 'default'),
-                FunctionVersion=lr['Version'],
-                Description='Created by greengo'
-            )
+                Name=l.get('alias', 'default')
+                )
             log.info("Lambda alias created. FunctionVersion:'{0}', Arn:'{1}'".format(
                 alias['FunctionVersion'], alias['AliasArn']))
 
@@ -378,9 +415,14 @@ class GroupCommands(object):
         _update_state(self.state)
 
         for l in self.state['Lambdas']:
-            log.info("Deleting Lambda function '{0}'".format(l['FunctionName']))
-            self._lambda.delete_function(FunctionName=l['FunctionName'])
-            os.remove(l['ZipPath'])
+            already_defined = ('already_defined' in l)
+            # print(l)
+            # print(l['name'])
+            # print("already defined?:  "+str(already_defined))
+            if not already_defined:
+                log.info("Deleting Lambda function '{0}'".format(l['FunctionName']))
+                self._lambda.delete_function(FunctionName=l['FunctionName'])
+                os.remove(l['ZipPath'])
 
         self.state.pop('Lambdas')
         _update_state(self.state)
@@ -803,12 +845,12 @@ class GroupCommands(object):
 
         config = {
             "coreThing": {
-                "caPath": "root-CA.crt",
-                "certPath": core_thing['thingName'] + ".pem",
-                "keyPath": core_thing['thingName'] + ".key",
+                "caPath": "root.ca.pem",
+                "certPath": core_thing['thingName'] + ".cert.pem",
+                "keyPath": core_thing['thingName'] + ".private.key",
                 "thingArn": core_thing['thingArn'],
                 "iotHost": self._iot_endpoint,
-                "ggHost": "greengrass.iot." + self._region + ".amazonaws.com",
+                "ggHost": "greengrass-ats.iot." + self._region + ".amazonaws.com",
                 "keepAlive": 600
             },
             "runtime": {
@@ -816,7 +858,19 @@ class GroupCommands(object):
                     "useSystemd": "yes"
                 }
             },
-            "managedRespawn": False
+            "managedRespawn": False,
+            "crypto" : {
+            "principals" : {
+              "SecretsManager" : {
+                "privateKeyPath" : "file:///greengrass/certs/" + core_thing['thingName'] + ".private.key"
+              },
+              "IoTCertificate" : {
+                "privateKeyPath" : "file:///greengrass/certs/" + core_thing['thingName'] + ".private.key",
+                "certificatePath" : "file:///greengrass/certs/" + core_thing['thingName'] + ".cert.pem"
+              }
+            },
+            "caPath" : "file:///greengrass/certs/root.ca.pem"
+          }
         }
 
         _mkdir(path)
@@ -931,9 +985,9 @@ def _save_keys(path, name, keys_cert):
     try:
         path = path + '/' if not path.endswith('/') else path
         _mkdir(path)
-        certname = path + name + ".pem"
+        certname = path + name + ".cert.pem"
         public_key_file = path + name + ".pub"
-        private_key_file = path + name + ".key"
+        private_key_file = path + name + ".private.key"
         with open(certname, "w") as pem_file:
             pem = keys_cert['certificatePem']
             pem_file.write(pem)

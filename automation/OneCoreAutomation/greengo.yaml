@@ -1,0 +1,35 @@
+Group:
+  name: GreengoGroup
+Cores:
+  - name: GreengoGroupCore
+    key_path: GreengoCerts/certs
+    config_path: GreengoCerts/config
+    SyncShadow: False
+
+Lambdas:
+  - name: GreengrassHelloWorld
+    handler: greengrassHelloWorld.function_handler
+    package: GreengrassHelloWorld
+    alias: dev
+    environment:
+      foo: bar
+    greengrassConfig:
+      MemorySize: 128000
+      Timeout: 10
+      Pinned: True
+      Environment:
+        AccessSysfs: False
+        Variables:
+           name: value
+
+Subscriptions:
+  - Source: Lambda::GreengrassHelloWorld
+    Subject: hello/world
+    Target: cloud
+
+Loggers:
+  - Component: Lambda
+    Id: logger_1
+    Level: DEBUG
+    Space: 1024
+    Type: FileSystem
