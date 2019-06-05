@@ -1,0 +1,33 @@
+Group:
+  name: {}
+Cores:
+  - name: {}-Core
+    key_path: {}-GG-Config/certs
+    config_path: {}-GG-Config/config
+    SyncShadow: False
+
+Lambdas:
+  - name: GreengrassHelloWorld
+    alias: dev
+    environment:
+      foo: bar
+    greengrassConfig:
+      MemorySize: 128000
+      Timeout: 10
+      Pinned: True
+      Environment:
+        AccessSysfs: False
+        Variables:
+           name: value
+
+Subscriptions:
+  - Source: Lambda::GreengrassHelloWorld
+    Subject: hello/world
+    Target: cloud
+
+Loggers:
+  - Component: Lambda
+    Id: logger_1
+    Level: DEBUG
+    Space: 1024
+    Type: FileSystem
