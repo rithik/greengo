@@ -16,3 +16,16 @@ Now that single device provisioning is working, the next logical step is to prov
 python3 bulk.py --number <NUMBER> generate
 ```
 where `<NUMBER>` should be replaced by the number of groups to be created. Note that number of groups to create must be less than or equal to the number of IP Addresses listed.
+
+
+### Bulk Deployment
+We have designed a way to create all of the cores required and now need a way to send updated code to these devices. In order to do this, we will have to use the code provided in the `Deployment` Folder. The code provided makes a huge assumption that when you do a bulk deploy, that you want to update the lambda function for EVERY group that is associated with your account. If this is not the intended behavior, please modify the code under the comment listed as `# Step 7`. In order to initiate the bulk deployment, use the following command in a terminal that has AWS configured:
+```
+python3 bulkDeploy.py --function-name <LAMBDA_FUNCTION_NAME> --folder <NAME_OF_ZIP_FILE_TO_BE_GENERATED> --program_name <NAME_OF_LAMBDA_CODE_FILE> --handler <LAMBDA_FUNCTION_HANDLER> --alias <LAMBDA_ALIAS> update-lambda
+```
+where `<LAMBDA_FUNCTION_NAME>` is the name of the Lambda function, `<NAME_OF_ZIP_FILE_TO_BE_GENERATED>` is any arbitrary name, `<NAME_OF_LAMBDA_CODE_FILE>` is the filename of the python program file, `<LAMBDA_FUNCTION_HANDLER>` is the string that tells the lambda function which code to run (usually in the format `filename.function`), and `<LAMBDA_ALIAS>` is the alias that is setup with all of the GreenGrass groups. This will have updated the lambda function code.
+
+Now, its time to deploy the changes to all of the groups. Run the following command to do so.
+```
+python3 bulkDeploy.py deploy
+```
